@@ -169,8 +169,8 @@ export function inputMessage(input: TicketInput, trigger?: object): string | und
  * and allows one extra slot beyond the limit for human follow-ups (`by === 'person'`) so they never wait behind new launches.
  */
 export class WorkerSlots {
-  /** Tickets currently holding a startup slot, mapped to whether the start is a launch, a wake, or a wake for a person's message. */
-  private readonly starting = new Map<string, 'launch' | 'wake' | 'person'>()
+  /** Reservations share one slot per ticket, but each attempt releases only its own reservation. */
+  private readonly starting = new Map<string, Map<symbol, 'launch' | 'wake' | 'person'>>()
   /**
    * @param running - Returns the ticket IDs whose worker holds a slot (see `DshExecutor.running`).
    * @param max - Returns the configured maximum number of concurrent worker slots.
@@ -180,22 +180,26 @@ export class WorkerSlots {
   used(): number { return new Set([...this.running(), ...this.starting.keys()]).size }
   /** How many launches may run concurrently: the slots not held by a running worker or a wake reservation. */
   launches(): number {
-    const wakes = [...this.starting].flatMap(([ticketId, by]) => by !== 'launch' ? [ticketId] : [])
+    const wakes = [...this.starting].flatMap(([ticketId, reservations]) => [...reservations.values()].some(by => by !== 'launch') ? [ticketId] : [])
     return this.max() - new Set([...this.running(), ...wakes]).size
   }
   /**
-   * Reserves a startup slot for `ticketId`; idempotent if `ticketId` already holds a starting slot.
+   * Reserves a startup slot for `ticketId`; overlapping attempts count as one slot and each gets its own release.
    * A wake for a person's message (`by === 'person'`) may use one extra slot beyond `max()`.
-   * Call `free(ticketId)` once the worker turn is running or the launch/wake attempt ends.
+   * Release once the worker turn is running or the launch/wake attempt ends.
    * @throws Later when no slot is free.
    */
-  reserve(ticketId: string, by: 'launch' | 'wake' | 'person'): void {
-    if (this.starting.has(ticketId)) return
-    if (this.used() >= this.max() + (by === 'person' ? 1 : 0)) throw new Later('No worker slot is free')
-    this.starting.set(ticketId, by)
+  reserve(ticketId: string, by: 'launch' | 'wake' | 'person'): () => void {
+    const reservations = this.starting.get(ticketId) ?? new Map<symbol, 'launch' | 'wake' | 'person'>()
+    if (!reservations.size && this.used() >= this.max() + (by === 'person' ? 1 : 0)) throw new Later('No worker slot is free')
+    const owner = Symbol()
+    reservations.set(owner, by)
+    this.starting.set(ticketId, reservations)
+    return () => {
+      if (!reservations.delete(owner)) return
+      if (!reservations.size) this.starting.delete(ticketId)
+    }
   }
-  /** Releases `ticketId`'s starting slot once its worker session is running or the launch/wake attempt has ended. */
-  free(ticketId: string): void { this.starting.delete(ticketId) }
 }
 
 /**
@@ -209,8 +213,8 @@ export class DshExecutor implements Executor {
   private readonly slots: WorkerSlots
   /** Transient failure counts tried so far: keyed by `assignment.id` for worker turns and `launch:<assignment.id>` for launches. */
   private readonly transient = new Map<string, number>()
-  /** Assignment IDs currently waiting on a transient-failure backoff timer before resuming their worker turn. */
-  private readonly resuming = new Set<string>()
+  /** Pending retries of each Assignment, including deliveries whose durability acknowledgement is still in flight. */
+  private readonly resuming = new Map<string, Set<symbol>>()
   /**
    * The looks at background work of workers that went idle, by ticket, which hold their slots; a look ends when its worker
    * runs again or its Assignment ends.
@@ -271,7 +275,7 @@ export class DshExecutor implements Executor {
     const ticket = this.host.store.tickets.get(ticketId)
     const assignment = ticket && latestAssignment(ticket)
     if (!ticket || !liveTicket(ticket) || assignment?.id !== assignmentId || assignment.state !== 'pending') return
-    this.slots.reserve(ticketId, 'launch')
+    const release = this.slots.reserve(ticketId, 'launch')
     try { await this.launch(ticket, assignment); this.transient.delete(`launch:${assignmentId}`) }
     catch (error) {
       // Shutdown or pause re-queues the launch for resume, and transient network/provider errors retry with backoff.
@@ -281,7 +285,7 @@ export class DshExecutor implements Executor {
       if (this.host.closing() || error instanceof Later) throw error
       if (!(error instanceof PrepareFailed) && this.retries(`launch:${assignmentId}`, error)) throw error
       this.launchFailed(ticketId, assignmentId, error)
-    } finally { this.slots.free(ticketId) }
+    } finally { release() }
   }
   /**
    * Delivers queued inputs to a running assignment one by one, re-reading ticket state before each delivery so delivery
@@ -293,7 +297,7 @@ export class DshExecutor implements Executor {
     const first = this.host.store.tickets.get(ticketId)
     const target = first && liveTicket(first) ? runningAssignment(first) : undefined
     if (!first || !target || !first.undelivered.length) return
-    let woken = false
+    let release: (() => void) | undefined
     try {
       for (;;) {
         const ticket = this.host.store.tickets.get(ticketId)
@@ -302,11 +306,10 @@ export class DshExecutor implements Executor {
         if (!ticket || !assignment || inputId === undefined) return
         // Waking an idle worker reserves a slot (including the extra slot reserved for human follow-ups).
         const sessionId = workerSessionId(ticketId)
-        if (!woken && !this.running(ticket)) {
+        if (!release && !this.running(ticket)) {
           // A person's message wakes its worker ahead of new launches, in the slot kept for it.
           const person = ticket.undelivered.some(id => fromPerson(ticket.inputs.find(item => item.id === id)))
-          this.slots.reserve(ticketId, person ? 'person' : 'wake')
-          woken = true
+          release = this.slots.reserve(ticketId, person ? 'person' : 'wake')
         }
         const input = ticket.inputs.find(item => item.id === inputId)
         try {
@@ -324,7 +327,7 @@ export class DshExecutor implements Executor {
         }
         this.host.engine.inputsDelivered(ticketId, assignment.id, [inputId])
       }
-    } finally { if (woken) this.slots.free(ticketId) }
+    } finally { release?.() }
   }
   private async deliverInput(ticket: Ticket, assignment: Assignment, input: TicketInput): Promise<void> {
     // Re-check right before session delivery because the ticket may have ended while awaiting `sourceLink`.
@@ -555,22 +558,42 @@ export class DshExecutor implements Executor {
   private resumeAfter(ticketId: string, assignmentId: string, error: unknown): void {
     const tries = this.transient.get(assignmentId)!
     const text = `Your last turn failed for a passing reason (${String(error).slice(0, 200)}). Continue the assignment where it stopped.`
-    this.resuming.add(assignmentId)
-    const go = () => {
+    const pending = this.resuming.get(assignmentId) ?? new Set<symbol>()
+    const retry = Symbol()
+    pending.add(retry); this.resuming.set(assignmentId, pending)
+    const finish = () => {
+      if (!pending.delete(retry)) return
+      if (!pending.size) this.resuming.delete(assignmentId)
+    }
+    const current = () => {
       if (this.host.closing()) return
       const ticket = this.host.store.tickets.get(ticketId)
-      if (!ticket || !liveTicket(ticket) || runningAssignment(ticket)?.id !== assignmentId) { this.resuming.delete(assignmentId); return }
+      return ticket && liveTicket(ticket) && runningAssignment(ticket)?.id === assignmentId && !waitsForPerson(ticket) ? ticket : undefined
+    }
+    const go = () => {
+      const ticket = current()
+      if (!ticket) { finish(); return }
       // Wait while processing is paused or no wake slot is free.
       if (this.host.paused()) { this.after(SLOT_WAIT_MS, go); return }
       const sessionId = workerSessionId(ticketId)
-      const waking = !this.running(ticket)
-      try { if (waking) this.slots.reserve(ticketId, 'wake') } catch (failure) {
+      let release: (() => void) | undefined
+      try { if (!this.running(ticket)) release = this.slots.reserve(ticketId, 'wake') } catch (failure) {
         if (!(failure instanceof Later)) throw failure
         this.after(SLOT_WAIT_MS, go); return
       }
-      const sent = this.host.sessions.prompt(sessionId, `retry:${assignmentId}:${tries}`, text, 'queue')
-      void this.background(sent.finally(() => { if (waking) this.slots.free(ticketId); this.resuming.delete(assignmentId) })
-        .catch(failure => { this.failed(ticketId, String(failure)) }))
+      let deferred = false
+      const sent = this.host.sessions.prompt(sessionId, `retry:${assignmentId}:${tries}`, text, 'queue', () => {
+        if (!current()) throw new Error('The retry Assignment is no longer current')
+        if (this.host.paused()) throw new Later('Processing is paused')
+      })
+      void this.background(sent.catch(failure => {
+        if (!current()) return
+        if (failure instanceof Later || this.host.paused()) { deferred = true; this.after(SLOT_WAIT_MS, go); return }
+        this.failed(ticketId, String(failure))
+      }).finally(() => {
+        release?.()
+        if (!deferred) finish()
+      }))
     }
     this.after(TRANSIENT_BACKOFF_MS * 2 ** (tries - 1), go)
   }

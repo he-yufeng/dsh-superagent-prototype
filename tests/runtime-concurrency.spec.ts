@@ -211,6 +211,17 @@ describe('a worker that goes on after a passing failure', () => {
   const busy = () => Object.assign(new Error('Service Unavailable'), { status: 503 })
   const told = (sessionId: string) => h.deliveries.mock.calls.map(([call]) => call)
     .filter(call => call.sessionId === sessionId && call.text.includes('Your last turn failed for a passing reason'))
+  /** Hold an automatic retry at the Session lookup, before AgentDelivery rechecks its authorization. */
+  async function pendingRetry(sessionId: string, gate: Promise<void>) {
+    const held = holdSession(sessionId, gate)
+    const prompts = vi.spyOn(h.runtime.sessions, 'prompt')
+    h.ctx.emit('agent/error', { agent: h.agents.get(sessionId), turn: 1, step: 1, error: busy() } as never)
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(held()).toBe(true)
+    const at = prompts.mock.calls.findIndex(([id, request]) => id === sessionId && request.startsWith('retry:'))
+    expect(at).toBeGreaterThanOrEqual(0)
+    return { prompts, attempt: prompts.mock.results[at]!.value as Promise<void> }
+  }
   it('starts the count of passing failures again once its turn ends as turns do', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
     const agent = h.agents.get(one.sessionId)!
@@ -252,6 +263,171 @@ describe('a worker that goes on after a passing failure', () => {
       await vi.advanceTimersByTimeAsync(60_000)
     } finally { vi.useRealTimers() }
     expect(told(one.sessionId)).toEqual([])
+  })
+  it('does not deliver a retry after its ticket stopped while the worker Session was resolving', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    const gate = deferred()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const { attempt } = await pendingRetry(one.sessionId, gate.promise)
+      h.runtime.engine.stopTicket(one.ticket.id)
+      gate.resolve()
+      await attempt.catch(() => {})
+      await h.runtime.idle()
+      expect(told(one.sessionId)).toEqual([])
+      expect(h.runtime.store.tickets.get(one.ticket.id)).toMatchObject({ ended: { by: 'human' } })
+      expect(h.runtime.health.worker?.state).not.toBe('error')
+    } finally { gate.resolve(); vi.useRealTimers() }
+  })
+  it.each(['blocked', 'failed'] as const)('does not resume an Assignment reported %s while its retry Session was resolving', async state => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    const gate = deferred()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const { attempt } = await pendingRetry(one.sessionId, gate.promise)
+      await h.runTool(one.sessionId, 'orchestrator_report', { state, summary: 'needs a person' })
+      gate.resolve(); await attempt.catch(() => {})
+      await vi.advanceTimersByTimeAsync(0)
+      expect(told(one.sessionId)).toEqual([])
+      expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report).toMatchObject({ state, summary: 'needs a person' })
+      expect(h.runtime.health.worker?.state).not.toBe('error')
+    } finally { gate.resolve(); vi.useRealTimers() }
+  })
+  it('keeps a retry waiting when processing pauses during its Session lookup', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    h.agents.get(one.sessionId)!.status = 'idle'
+    const gate = deferred()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const { attempt, prompts } = await pendingRetry(one.sessionId, gate.promise)
+      await h.runtime.settings.pause(true, 'panel')
+      gate.resolve(); await attempt.catch(() => {})
+      await vi.advanceTimersByTimeAsync(0)
+      expect(told(one.sessionId)).toEqual([])
+      idle(one.sessionId)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report).toBeUndefined()
+      expect(h.runtime.health.worker?.state).not.toBe('error')
+      await h.runtime.settings.pause(false, 'panel')
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(told(one.sessionId)).toHaveLength(1)
+      const ids = prompts.mock.calls.filter(([id, request]) => id === one.sessionId && request.startsWith('retry:')).map(([, request]) => request)
+      expect(new Set(ids).size).toBe(1)
+    } finally { gate.resolve(); vi.useRealTimers() }
+  })
+  it('does not deliver an old retry to the Assignment that replaced it during Session lookup', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    const gate = deferred()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const { attempt } = await pendingRetry(one.sessionId, gate.promise)
+      await h.runTool(one.sessionId, 'orchestrator_report', { state: 'failed', summary: 'needs a fresh attempt' })
+      h.runtime.engine.retryTicket(one.ticket.id)
+      await h.runtime.idle()
+      const replacement = latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)!
+      expect(replacement.id).not.toBe(latestAssignment(one.ticket)!.id)
+      gate.resolve(); await attempt.catch(() => {})
+      await vi.advanceTimersByTimeAsync(0)
+      expect(told(one.sessionId)).toEqual([])
+      expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)).toEqual(replacement)
+      expect(h.runtime.health.worker?.state).not.toBe('error')
+    } finally { gate.resolve(); vi.useRealTimers() }
+  })
+  it('does not fail a replacement Assignment when an old retry Session lookup fails', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    const gate = deferred()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const { attempt } = await pendingRetry(one.sessionId, gate.promise)
+      await h.runTool(one.sessionId, 'orchestrator_report', { state: 'failed', summary: 'needs a fresh attempt' })
+      h.runtime.engine.retryTicket(one.ticket.id)
+      await h.runtime.idle()
+      const replacement = latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)!
+      gate.reject(new Error('Session lookup failed'))
+      await attempt.catch(() => {})
+      await vi.advanceTimersByTimeAsync(0)
+      expect(told(one.sessionId)).toEqual([])
+      expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)).toEqual(replacement)
+      expect(h.runtime.health.worker?.state).not.toBe('error')
+    } finally { gate.resolve(); vi.useRealTimers() }
+  })
+  it('does not touch the closed Store when the host stops during a retry Session lookup', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    const gate = deferred()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const { attempt } = await pendingRetry(one.sessionId, gate.promise)
+      await h.runtime.stop()
+      gate.resolve(); await attempt.catch(() => {})
+      await vi.advanceTimersByTimeAsync(0)
+      expect(told(one.sessionId)).toEqual([])
+      expect(h.runtime.health.worker?.state).not.toBe('error')
+    } finally { gate.resolve(); vi.useRealTimers() }
+  })
+  it('keeps a replacement launch counted when an old retry releases its wake reservation', async () => {
+    const settings = h.runtime.store.settings()
+    h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, maxWorkers: 2 } })
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    idle(one.sessionId); await h.runtime.idle()
+    const two = await h.acceptedTicket(feishu('5', '@bot 修二'))
+    idle(two.sessionId); await h.runtime.idle()
+    const three = await h.acceptedTicket(feishu('9', '@bot 修三'))
+    idle(three.sessionId); await h.runtime.idle()
+    const retryGate = deferred(), launchGate = deferred()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const { attempt } = await pendingRetry(one.sessionId, retryGate.promise)
+      await h.runTool(one.sessionId, 'orchestrator_report', { state: 'failed', summary: 'needs a fresh attempt' })
+      const launching = holdSession(one.sessionId, launchGate.promise)
+      h.runtime.engine.retryTicket(one.ticket.id)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(launching()).toBe(true)
+      retryGate.resolve(); await attempt.catch(() => {})
+      await vi.advanceTimersByTimeAsync(0)
+      h.runtime.receive(feishu('6', 'CI 二失败', { mentions: [], root_id: 'om_5', sender_id: 'cli_ci', sender_type: 'bot' }))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.agents.get(two.sessionId)!.status).toBe('running')
+      h.runtime.receive(feishu('10', 'CI 三失败', { mentions: [], root_id: 'om_9', sender_id: 'cli_ci', sender_type: 'bot' }))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.agents.get(three.sessionId)!.status).toBe('idle')
+      expect(h.runtime.store.tickets.get(three.ticket.id)!.undelivered).toHaveLength(1)
+      launchGate.resolve(); await h.runtime.idle()
+    } finally { retryGate.resolve(); launchGate.resolve(); vi.useRealTimers() }
+  })
+  it('keeps a later retry pending when an earlier delivery finishes its durability flush', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    h.agents.get(one.sessionId)!.status = 'idle'
+    const gate = deferred()
+    const persistence = h.ctx.get('sessionPersistence') as { flush(): Promise<void> }
+    vi.spyOn(persistence, 'flush').mockImplementationOnce(() => gate.promise)
+    const prompts = vi.spyOn(h.runtime.sessions, 'prompt')
+    const fail = () => h.ctx.emit('agent/error', { agent: h.agents.get(one.sessionId), turn: 1, step: 1, error: busy() } as never)
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      fail(); await vi.advanceTimersByTimeAsync(15_000)
+      expect(told(one.sessionId)).toHaveLength(1)
+      // The retry started a new turn, whose failure arrived before the previous delivery was acknowledged.
+      fail()
+      const at = prompts.mock.calls.findIndex(([id, request]) => id === one.sessionId && request.startsWith('retry:'))
+      gate.resolve(); await prompts.mock.results[at]!.value
+      await vi.advanceTimersByTimeAsync(0)
+      idle(one.sessionId); await vi.advanceTimersByTimeAsync(0)
+      expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report).toBeUndefined()
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(told(one.sessionId)).toHaveLength(2)
+    } finally { gate.resolve(); vi.useRealTimers() }
+  })
+  it('delivers a pending retry once when its Assignment is still current', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    const gate = deferred()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const { attempt } = await pendingRetry(one.sessionId, gate.promise)
+      gate.resolve(); await attempt
+      await vi.advanceTimersByTimeAsync(0)
+      expect(told(one.sessionId)).toHaveLength(1)
+      expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report).toBeUndefined()
+    } finally { gate.resolve(); vi.useRealTimers() }
   })
 })
 describe('a worker whose work runs in the background', () => {
@@ -854,16 +1030,29 @@ describe('the Executor\'s parts', () => {
     const running = ['t1']
     const slots = new WorkerSlots(() => running, () => 3)
     slots.reserve('t2', 'launch')
-    slots.reserve('t3', 'wake')
+    const release = slots.reserve('t3', 'wake')
     expect(slots.used()).toBe(3)
     // launches() excludes 'launch' reservations because the launch queue tracks active launches separately.
     expect(slots.launches()).toBe(1)
     expect(() => slots.reserve('t4', 'wake')).toThrow(Later)
-    expect(() => slots.reserve('t3', 'wake')).not.toThrow()
-    slots.free('t3')
+    const again = slots.reserve('t3', 'wake')
+    expect(slots.used()).toBe(3)
+    again(); release()
     expect(slots.used()).toBe(2)
     slots.reserve('t4', 'launch')
     expect(slots.used()).toBe(3)
+  })
+  it('keeps a later startup reservation when an earlier owner of the same ticket finishes', () => {
+    const slots = new WorkerSlots(() => [], () => 1)
+    const earlier = slots.reserve('t1', 'wake')
+    const later = slots.reserve('t1', 'launch')
+    expect(slots.used()).toBe(1)
+    earlier()
+    expect(slots.used()).toBe(1)
+    expect(() => slots.reserve('t2', 'launch')).toThrow(Later)
+    later()
+    expect(slots.used()).toBe(0)
+    expect(() => slots.reserve('t2', 'launch')).not.toThrow()
   })
   it('wakes a worker for a person\'s message in the one slot beyond the limit, and ahead of launches once a slot frees up', () => {
     const running = ['t1', 't2', 't3']
