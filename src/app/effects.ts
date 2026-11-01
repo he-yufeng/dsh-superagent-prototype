@@ -13,6 +13,8 @@ export interface EffectPayloads {
   assessment: { triggerId: string }
   /** Launch a pending Assignment; the key is the Assignment ID. */
   launch: { ticketId: string; assignmentId: string }
+  /** Confirm a retained prepare range exited before an explicitly requested recovery; the key is the preparation attempt ID. */
+  preparation: { ticketId: string; attemptId: string; assignmentId: string; inputId?: string }
   /** Hand a ticket's waiting Inputs to its running Assignment; the key is the Ticket ID. */
   delivery: { ticketId: string }
   /** Steer a report or a candidate into the main Session; the key is the request ID. */

@@ -1101,7 +1101,8 @@ it('runs the prepare command once for a new ticket, under the execution root wit
 it('counts a ticket whose directory the host prepared before prepare commands existed as prepared', async () => {
   const { ticket, sessionId } = await acceptedTicket()
   await runTool(sessionId, 'orchestrator_report', { state: 'failed', summary: 'offline' })
-  // A ticket from before prepare commands has its worktree.
+  // A ticket from before prepare commands has its worktree and no preparation record.
+  runtime.store.delete(KV.executor.preparation(ticket.id))
   const stored = runtime.store.tickets.get(ticket.id)!
   runtime.store.tickets.save({ ...stored, execution: { ...stored.execution!, directory } })
   runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, prepare: 'exit 1' } })

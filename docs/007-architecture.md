@@ -173,12 +173,13 @@ Failures retry with exponential backoff. Throwing `Later` defers work without co
 | --- | --- | --- | --- | --- |
 | `assessment` | MasterAssessor | Steers an Eval's candidate card into the main Session's turn, then tells the Engine it was delivered, which starts the Eval's deadline | 4, none while paused | 2 s doubling to 60 s |
 | `launch` | DshExecutor | Launches a pending Assignment: prepare command, Executor Session, assignment message | The free worker slots, none while paused | A passing failure of the model provider or the network runs again after 5 s doubling to 300 s, three times; any other failure, and a failed prepare command, fails its Ticket. One held by a pause or by full worker slots tries again after 5 s |
+| `preparation` | DshExecutor | Rechecks an unconfirmed prepare range for a new recovery request; releases its held slot and queues the requested launch only after exit is confirmed | 4, also while paused; no additional worker slot | An observation failure reports failed and waits for another request; queue or storage failures use 2 s doubling to 60 s |
 | `delivery` | DshExecutor | Hands a Ticket's waiting Inputs to its running Assignment, in order | 4, none while paused | 2 s doubling to 60 s; one that waits for a worker slot tries again after 2 s |
 | `relay` | Sessions | Steers a worker's report or question, or a person's follow-up, into the main Session's turn | 1, in queue order | 2 s doubling to 60 s |
 | `notice` | Sessions | Injects a notice into the main Session without waking it | 1, in queue order | 2 s doubling to 60 s |
 | `reply` | Outbox | Sends a message for a Channel through its Source, after the earlier messages of its Ticket to its conversation that have not failed three times; withdrawing the message cancels it | 1, none while paused | 5 s doubling to 300 s; one whose Source is off, or behind an earlier message, tries again after 5 s |
 
-Each kind has a health entry under its name. It reports an error once one of its effects failed three times in a row, except `delivery`, whose failures show on their Ticket instead. Relays keep their order, and so do notices; a failed one holds back the later ones of its kind.
+Each kind has a health entry under its name. It reports an error once one of its effects failed three times in a row, except `delivery` and `preparation`, whose failures show on their Ticket instead; an unconfirmed preparation range also holds the Executor's `worker` health entry in error. Relays keep their order, and so do notices; a failed one holds back the later ones of its kind.
 
 ### Sources
 
@@ -199,6 +200,8 @@ That context supplies deployment and commands, setup readiness (`ready`, `config
 `DshExecutor` (`src/executor/dsh.ts`) provides one Session and directory per Ticket. `start` and `deliver` enqueue `launch` and `delivery` effects. `stop` cancels the turn through `Store.afterCommit`, so a rolled-back end does not stop the worker.
 
 `prepare(ticket, outcome)` supplies the Engine's `prepareTicket` hook: short name, directory and `ticketExecution` assignment text. `workerSessionId(ticket.id)` derives the Session id.
+
+The Executor owns a typed preparation record per Ticket, binding its directory, attempt ID and authorizing Assignment/Input. Only that attempt can write its outcome. A recovered `started` record is unknown and needs a new recovery request; `ready` requires both process-range exit and directory verification. An `unsettled` record preserves a range whose exit could not be confirmed, including its slot across reloads. A `preparation` effect rechecks the retained handle for a new request. Handles are retained only within the same subprocess provider and state directory; if the handle is unavailable, recovery stays blocked. The Engine still owns Ticket fields and reports.
 
 `WorkerSlots` reserves capacity before a launch or a delivery that wakes an idle worker. A human message can use one slot beyond `maxWorkers`, and wakes have priority over launches. `activeCount` supplies panel load.
 
@@ -426,6 +429,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP |
 | `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role, and the shapes and checks of the other main Session tools |
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
+| `tests/runtime-preparation.spec.ts` | Durable preparation outcomes, partial directories, explicit retry and human Input identity, unknown crash recovery, retained range observation across reloads, stale completions and legacy workspaces |
 | `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
 | `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, and the refusals of the pause, a sync and a block |
 | `tests/views.spec.ts` | What the management views derive from the Store, such as the Thread a dropped message belongs to |
@@ -474,6 +478,7 @@ A generated column is computed from its row's JSON and is empty outside its set,
 | Prompt versions | `prompt-revision`, `prompt-version:<n>` |
 | Main Session | `master-id` |
 | Session prompt history | `session-prompts:<session id>` |
+| Workspace preparation | `executor-prepare:<ticket id>`; directory, attempt ID, authorizing Assignment/Input, `started` / `ready` / `failed` / `unsettled`, and the last error; written only by the Executor |
 | Source state | Read positions such as `github-cursor:<number>`, PR CI fingerprints and seen Feishu-topic messages; keys begin with the kind or `thread-` plus a Thread key |
 | Display names | `source-labels:<source id>` |
 

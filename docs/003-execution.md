@@ -42,19 +42,32 @@ A person can also start a turn by writing directly in the Executor Session. Its 
 
 When an Assignment ends, its shell jobs are killed without waking the Session. Its subagents are released, and any completion turns they wake are dropped. The replacement Assignment and its waiting Inputs start after that shutdown finishes.
 
-Stopping or restarting the plugin inside the DeepSeek Harness process uses the same shutdown path. Inputs not yet taken into Session history are retained. Shutdown waits up to 10 seconds for each worker's background work; a process restart ends that work outright. An Assignment interrupted while busy restarts with a recovery note.
+Stopping or restarting the plugin inside the DeepSeek Harness process uses the same shutdown path. Inputs not yet taken into Session history are retained. Shutdown waits up to 10 seconds for each worker's background work; full host exit relies on the subprocess provider's cleanup guarantees. An Assignment interrupted while busy restarts with a recovery note.
 
 Worker subagents, including nested ones, use DeepSeek Harness's `standard` preset with the worker's permissions. They retain only the worker's allowed work tools, and lose those tools when the Ticket ends. Under `standard`, a shell command moves to the background after 60 seconds. A subagent's jobs are killed when it ends.
 
 ### Preparing a Ticket directory
 
-Before the first Assignment, if the Ticket directory does not exist, the prepare command runs once with `sh` in the execution root. Its managed process range has ten minutes to finish, not just the root command. Without a prepare command, the worker starts in an empty directory.
+Before an Assignment starts, the Executor prepares its Ticket directory when it is missing or its recorded preparation has not succeeded. The command runs with `sh` in the execution root. Preparation, including the provider's managed process range, has ten minutes to finish. Without a prepare command, a new worker starts in an empty directory.
+
+The Executor records each attempt before starting work and records success only after the command, managed range and directory verification have finished. The record belongs to one Ticket and directory, with a unique attempt ID and the Assignment/Input that authorized it. A later result cannot overwrite a newer attempt.
+
+| Recorded state | Meaning |
+| --- | --- |
+| `started` | Preparation began but has no recorded outcome; after interruption, its result is unknown |
+| `ready` | Preparation and directory verification succeeded; retries reuse this workspace |
+| `failed` | Preparation failed and its range is confirmed stopped; files may remain |
+| `unsettled` | Range exit could not be confirmed; the directory and startup slot remain held, including after a reload |
+
+A failed or interrupted preparation needs a new recovery request, not an automatic queue retry. Inspect the existing files and any preparation processes left by an interruption, and fix the command or environment first. An explicit Ticket retry or a new human Input on one of its Threads can authorize another attempt. A new Input can retry the same pending Assignment, so the Assignment ID alone is not a retry permit. Existing directories without any preparation record remain usable for compatibility with earlier versions; a recorded failure cannot take that path. Non-empty directories are never removed to make a retry work.
 
 Stopping the Assignment cancels its preparation after the stop transaction commits, even before a worker Session exists. A pause does not cancel an ongoing preparation; its worker waits until processing resumes. Host shutdown and the preparation deadline also cancel the command.
 
-Cancellation holds the startup slot until the subprocess provider confirms that its managed range is empty. Cleanup has a separate ten-second observation deadline. If that confirmation times out or fails, worker health reports the problem and this Runtime keeps the directory and slot held. A retry cannot bypass that barrier. Files left by the command are retained; the provider's range must be confirmed stopped before the directory can be reused. This does not establish that processes outside the provider's observable range have exited.
+Cancellation holds the startup slot until the subprocess provider confirms that its managed range is empty. Cleanup has a separate ten-second observation deadline. If confirmation times out or fails, worker health reports the problem and the `unsettled` record preserves the barrier. A new retry or human Input first queues an exit observation, not another shell command. Only a positive observation releases the old slot and permits the requested preparation to start. Exit observations can finish while paused, but the launch still waits.
 
-A failed command fails the Ticket and records its output. A retry or a person's message on one of the Ticket's Threads tries preparation again. A typical command uses `git worktree` to create a checkout. A pull request belongs to the Ticket when its branch's last path segment matches the Ticket's short name.
+Preparation handles survive a plugin reload within the same provider and state directory. If a provider replacement or process restart loses the handle, the record stays blocked: neither root exit nor a new request proves that an unobservable range is empty. That is an operator recovery case, not a normal Ticket retry. The exit guarantee never extends to processes outside the provider's observable range.
+
+A typical prepare command uses `git worktree` to create a checkout. It must handle files from an earlier failed attempt, or those files must be repaired before retrying. A pull request belongs to the Ticket when its branch's last path segment matches the Ticket's short name.
 
 ### Concurrency
 

@@ -39,6 +39,7 @@ const TEXT = {
   'health.models': ['模型服务', 'Model service'],
   'health.assessment': ['发给主 Session 的评估', 'Evals sent to the main Session'],
   'health.launch': ['派工启动', 'Assignment launches'],
+  'health.preparation': ['准备进程退出复核', 'Preparation exit checks'],
   'health.delivery': ['输入送达', 'Input delivery to Assignments'],
   'health.relay': ['转达给主 Session 的消息', 'Relays to the main Session'],
   'health.notice': ['给主 Session 的通知', 'Notices to the main Session'],
