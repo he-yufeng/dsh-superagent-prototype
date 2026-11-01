@@ -294,9 +294,10 @@ export class DshExecutor implements Executor {
     const finish = (state: WorkspacePreparation['state'], error?: string) => {
       if (owns()) this.host.store.set(key, { ...record, state, ...error ? { error } : {} })
     }
-    let handle: SubprocessHandle | undefined
+    let handle: SubprocessHandle | undefined, recorded = false
     try {
       this.host.store.set(KV.executor.preparation(ticket.id), record)
+      recorded = true
       await mkdir(dirname(directory), { recursive: true })
       signal.throwIfAborted()
       const command = this.host.store.settings().executor.prepare.trim()
@@ -315,6 +316,7 @@ export class DshExecutor implements Executor {
       signal.throwIfAborted()
       finish('ready')
     } catch (error) {
+      if (!recorded) throw error
       if (handle) {
         try {
           handle.terminate()

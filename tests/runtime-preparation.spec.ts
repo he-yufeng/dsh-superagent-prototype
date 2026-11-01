@@ -271,6 +271,21 @@ it.each([false, true])('runs preparation again after a failed command on explici
   if (nonempty) expect(readFileSync(join(directory, 'partial.txt'), 'utf8')).toBe('work left by the failed command\n')
 })
 
+it('does not start a worker when the new preparation record cannot be persisted', async () => {
+  const attempts = failingPreparation(true)
+  const one = await h.acceptedTicket(feishu('1', '@bot 修一')), key = KV.executor.preparation(one.ticket.id)
+  const previous = h.runtime.store.get(key), set = h.runtime.store.set.bind(h.runtime.store)
+  vi.spyOn(h.runtime.store, 'set').mockImplementation((name, value) => {
+    if (name === key) throw new Error('Cannot persist preparation state')
+    set(name, value)
+  })
+  h.runtime.engine.retryTicket(one.ticket.id); await h.runtime.idle()
+  expect(h.agents.has(one.sessionId)).toBe(false)
+  expect(attempts()).toBe(1)
+  expect(h.runtime.store.get(key)).toEqual(previous)
+  expect(h.runtime.store.tickets.get(one.ticket.id)!.assignments.at(-1)!.report).toMatchObject({ state: 'failed', summary: expect.stringContaining('Cannot persist preparation state') })
+})
+
 it('does not let a stale launch effect repeat a failed prepare without a new request', async () => {
   const attempts = failingPreparation(true)
   const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
