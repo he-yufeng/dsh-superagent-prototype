@@ -1,13 +1,21 @@
 /** Concurrent runtime behavior across overlapping triggers, deliveries, and worker launches. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import * as fs from 'node:fs/promises'
+import { join } from 'node:path'
 import { latestAssignment, waitsForPerson, type Ticket, type Trigger } from '../src/core/index.ts'
 import { Later } from '../src/app/effects.ts'
 import { reportRelay } from '../src/app/notices.ts'
 import { WorkerSlots, inputMessage, mandateInstructions, ticketExecution, transient, triggerMessage } from '../src/executor/dsh.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { Commands } from '../src/infra/commands.ts'
-import { deferred, waitUntil } from './fixtures/async.ts'
+import { deferred, track, waitUntil } from './fixtures/async.ts'
 import { CHAT, MEMBER, feishu, startRuntime, type Host } from './fixtures/host.ts'
+
+vi.mock(import('node:fs/promises'), async original => {
+  const fs = await original()
+  return { ...fs, stat: vi.fn(fs.stat) as typeof fs.stat }
+})
 
 let h: Host
 beforeEach(async () => { h = await startRuntime() })
@@ -105,6 +113,197 @@ it('runs prepare commands in the background, side by side, while accepts, intake
   expect(h.runtime.store.tickets.list().map(ticket => ticket.assignments.at(-1)!.state)).toEqual(['running', 'running'])
 })
 
+it('cancels a ticket\'s prepare command only after its stop commits', async () => {
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, prepare: 'prepare worktree' } })
+  const prepare = deferred()
+  h.hooks.prepare = prepare.promise
+  h.runtime.receive(feishu('1', '@bot 修一')); await h.runtime.idle()
+  try {
+    await h.route({ kind: 'accept', trigger_id: feishu('1', '').id, title: 'fix', worktree_name: 'fix-one', acknowledgement: '收到。' })
+    await waitUntil(() => h.subprocess.spawn.mock.calls.some(([spec]) => spec.argv[0] === 'sh'))
+    const spec = h.subprocess.spawn.mock.calls.find(([value]) => value.argv[0] === 'sh')![0]
+    const ticket = h.runtime.store.tickets.list()[0]!
+    expect(() => h.runtime.store.atomic(() => { h.runtime.engine.stopTicket(ticket.id); throw new Error('rolled back') })).toThrow('rolled back')
+    expect(spec.signal!.aborted).toBe(false)
+    h.runtime.engine.stopTicket(ticket.id)
+    expect(spec.signal!.aborted).toBe(true)
+    expect(h.agents.has(`worker-${ticket.id}`)).toBe(false)
+  } finally { prepare.resolve(); await h.runtime.idle() }
+})
+
+it('stops only the prepare command of the ticket that ended', async () => {
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, prepare: 'prepare worktree' } })
+  const prepare = deferred()
+  h.hooks.prepare = prepare.promise
+  const first = feishu('1', '@bot 修一'), second = feishu('2', '@bot 修二')
+  h.runtime.receive(first); h.runtime.receive(second); await h.runtime.idle()
+  try {
+    for (const [index, trigger] of [first, second].entries()) {
+      await h.route({ kind: 'accept', trigger_id: trigger.id, title: 'fix', worktree_name: `fix-${index}`, acknowledgement: '收到。' })
+    }
+    await waitUntil(() => h.subprocess.spawn.mock.calls.filter(([spec]) => spec.argv[0] === 'sh').length === 2)
+    const one = h.runtime.store.tickets.list().find(ticket => ticket.origin.triggerId === first.id)!
+    const two = h.runtime.store.tickets.list().find(ticket => ticket.origin.triggerId === second.id)!
+    const specs = h.subprocess.spawn.mock.calls.map(([spec]) => spec).filter(spec => spec.argv[0] === 'sh')
+    h.runtime.engine.stopTicket(one.id)
+    expect(specs.find(spec => spec.env?.DSH_SUPERAGENT_TICKET === one.id)!.signal!.aborted).toBe(true)
+    expect(specs.find(spec => spec.env?.DSH_SUPERAGENT_TICKET === two.id)!.signal!.aborted).toBe(false)
+    prepare.resolve(); await h.runtime.idle()
+    expect(h.agents.has(`worker-${one.id}`)).toBe(false)
+    expect(h.runtime.store.tickets.get(two.id)!.assignments.at(-1)!.state).toBe('running')
+  } finally { prepare.resolve(); await h.runtime.idle() }
+})
+
+it('starts no prepare command for a ticket stopped during the directory lookup', async () => {
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, prepare: 'prepare worktree' } })
+  const trigger = feishu('1', '@bot 修一')
+  h.runtime.receive(trigger); await h.runtime.idle()
+  const lookup = deferred()
+  const stat = vi.mocked(fs.stat).mockClear().mockImplementationOnce(async () => { await lookup.promise; throw new Error('not found') })
+  try {
+    await h.route({ kind: 'accept', trigger_id: trigger.id, title: 'fix', worktree_name: 'fix-one', acknowledgement: '收到。' })
+    await waitUntil(() => stat.mock.calls.length > 0)
+    const ticket = h.runtime.store.tickets.list()[0]!
+    expect(stat.mock.calls[0]![0]).toBe(ticket.execution!.directory)
+    h.runtime.engine.stopTicket(ticket.id)
+    lookup.resolve(); await h.runtime.idle()
+    expect(h.subprocess.spawn.mock.calls.some(([spec]) => spec.argv[0] === 'sh')).toBe(false)
+    expect(h.agents.has(`worker-${ticket.id}`)).toBe(false)
+  } finally { lookup.resolve(); await h.runtime.idle() }
+})
+
+describe('a preparation with a managed process range', () => {
+  const prepares = () => h.subprocess.spawn.mock.calls.filter(([spec]) => spec.argv[0] === 'sh').length
+  async function preparing() {
+    const settings = h.runtime.store.settings()
+    h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, maxWorkers: 1, prepare: 'prepare worktree' } })
+    const command = deferred(), range = deferred()
+    h.hooks.prepare = command.promise; h.hooks.prepareExit = range.promise
+    const trigger = feishu('1', '@bot 修一')
+    h.runtime.receive(trigger); await h.runtime.idle()
+    const accepted = await h.route({ kind: 'accept', trigger_id: trigger.id, title: 'fix', worktree_name: 'fix-one', acknowledgement: '收到。' })
+    await waitUntil(() => prepares() === 1)
+    const index = h.subprocess.spawn.mock.calls.findIndex(([spec]) => spec.argv[0] === 'sh')
+    const spec = h.subprocess.spawn.mock.calls[index]![0], result = h.subprocess.spawn.mock.results[index]!
+    if (result.type !== 'return') throw new Error('Prepare spawn did not return a handle')
+    const ticket = h.runtime.store.tickets.get((accepted.ticket as { ticket_id: string }).ticket_id)!
+    return { command, range, spec, handle: result.value, ticket, sessionId: `worker-${ticket.id}` }
+  }
+
+  it('holds a cancelled prepare slot until its range exits, not just its root command', async () => {
+    const one = await preparing()
+    try {
+      h.hooks.prepare = undefined; h.hooks.prepareExit = undefined
+      const second = feishu('2', '@bot 修二')
+      h.runtime.receive(second); await h.runtime.pump()
+      await h.route({ kind: 'accept', trigger_id: second.id, title: 'fix', worktree_name: 'fix-two', acknowledgement: '收到。' })
+      h.runtime.engine.stopTicket(one.ticket.id)
+      h.runtime.engine.stopTicket(one.ticket.id)
+      one.command.resolve()
+      await waitUntil(() => one.handle.waitForExit.mock.calls.length > 0 || prepares() > 1)
+      expect(prepares()).toBe(1)
+      expect(one.handle.waitForExit).toHaveBeenCalled()
+      const waiting = one.handle.waitForExit.mock.calls.at(-1)![0]!
+      expect(waiting).not.toBe(one.spec.signal)
+      expect(waiting.aborted).toBe(false)
+      expect(h.agents.has(one.sessionId)).toBe(false)
+      one.range.resolve(); await h.runtime.idle()
+      expect(prepares()).toBe(2)
+      expect(h.runtime.store.tickets.list().find(ticket => ticket.origin.triggerId === second.id)!.assignments.at(-1)!.state).toBe('running')
+    } finally { one.command.resolve(); one.range.resolve(); await h.runtime.idle() }
+  })
+
+  it('waits for a successful prepare command\'s whole range before creating its worker', async () => {
+    const one = await preparing()
+    try {
+      one.command.resolve()
+      await waitUntil(() => one.handle.waitForExit.mock.calls.length > 0 || h.agents.has(one.sessionId))
+      expect(h.agents.has(one.sessionId)).toBe(false)
+      expect(one.handle.waitForExit).toHaveBeenCalled()
+      one.range.resolve(); await h.runtime.idle()
+      expect(h.agents.get(one.sessionId)!.status).toBe('running')
+    } finally { one.command.resolve(); one.range.resolve(); await h.runtime.idle() }
+  })
+
+  it('keeps shutdown waiting for the cancelled preparation\'s range', async () => {
+    const one = await preparing()
+    const stopped = track(h.runtime.stop())
+    try {
+      expect(one.spec.signal!.aborted).toBe(true)
+      one.command.resolve()
+      await waitUntil(() => one.handle.waitForExit.mock.calls.length > 0 || stopped.settled)
+      expect(stopped.settled).toBe(false)
+      expect(one.handle.waitForExit.mock.calls.at(-1)![0]!.aborted).toBe(false)
+      one.range.resolve(); await stopped.promise
+      expect(h.agents.has(one.sessionId)).toBe(false)
+    } finally { one.command.resolve(); one.range.resolve(); await stopped.promise }
+  })
+
+  it('cancels a timed out prepare and confirms cleanup before failing the ticket', async () => {
+    const deadline = new AbortController(), timeout = AbortSignal.timeout.bind(AbortSignal)
+    vi.spyOn(AbortSignal, 'timeout').mockImplementation(ms => ms === 10 * 60_000 ? deadline.signal : timeout(ms))
+    const one = await preparing()
+    try {
+      deadline.abort(new DOMException('Prepare timeout', 'TimeoutError'))
+      expect(one.spec.signal!.aborted).toBe(true)
+      one.command.resolve(); one.range.resolve(); await h.runtime.idle()
+      expect(one.handle.terminate).toHaveBeenCalledOnce()
+      expect(one.handle.waitForExit.mock.calls.at(-1)![0]!.aborted).toBe(false)
+      expect(h.runtime.store.tickets.get(one.ticket.id)!.assignments.at(-1)!.report).toMatchObject({ state: 'failed', summary: expect.stringContaining('Prepare timeout') })
+      expect(h.agents.has(one.sessionId)).toBe(false)
+      expect(h.runtime.health.worker?.state).not.toBe('error')
+    } finally { one.command.resolve(); one.range.resolve(); await h.runtime.idle() }
+  })
+
+  it('creates no worker when a stop coincides with the range exit confirmation', async () => {
+    const one = await preparing()
+    one.handle.waitForExit.mockImplementationOnce(async () => { h.runtime.engine.stopTicket(one.ticket.id); return true })
+    try {
+      one.command.resolve(); one.range.resolve(); await h.runtime.idle()
+      expect(one.spec.signal!.aborted).toBe(true)
+      expect(h.agents.has(one.sessionId)).toBe(false)
+      expect(h.runtime.store.tickets.get(one.ticket.id)).toMatchObject({ ended: { by: 'human' } })
+      expect(h.runtime.health.worker?.state).not.toBe('error')
+    } finally { one.command.resolve(); one.range.resolve(); await h.runtime.idle() }
+  })
+
+  it.each(['timeout', 'observation failure'])('blocks retry and retains output after range cleanup %s', async cause => {
+    const deadline = new AbortController(), cleanup = new AbortController(), timeout = AbortSignal.timeout.bind(AbortSignal)
+    vi.spyOn(AbortSignal, 'timeout').mockImplementation(ms => ms === 10 * 60_000 ? deadline.signal : ms === 10_000 ? cleanup.signal : timeout(ms))
+    const one = await preparing()
+    const directory = one.ticket.execution!.directory
+    mkdirSync(directory, { recursive: true }); writeFileSync(join(directory, 'partial.txt'), 'keep this work\n')
+    if (cause === 'observation failure') one.handle.waitForExit.mockRejectedValue(new Error('provider cannot observe its range'))
+    try {
+      deadline.abort(new DOMException('Prepare timeout', 'TimeoutError'))
+      one.command.resolve()
+      if (cause === 'timeout') {
+        await waitUntil(() => one.handle.waitForExit.mock.calls.some(([signal]) => signal === cleanup.signal))
+        cleanup.abort(new DOMException('Cleanup timeout', 'TimeoutError'))
+      }
+      await waitUntil(() => !!h.runtime.store.tickets.get(one.ticket.id)!.assignments.at(-1)!.report || h.agents.has(one.sessionId))
+      expect(h.runtime.store.tickets.get(one.ticket.id)!.assignments.at(-1)!.report).toMatchObject({ state: 'failed', summary: expect.stringContaining('Could not confirm') })
+      expect(h.agents.has(one.sessionId)).toBe(false)
+      expect(existsSync(directory)).toBe(true)
+      expect(readFileSync(join(directory, 'partial.txt'), 'utf8')).toBe('keep this work\n')
+      h.runtime.engine.retryTicket(one.ticket.id); await h.runtime.idle()
+      expect(prepares()).toBe(1)
+      expect(h.agents.has(one.sessionId)).toBe(false)
+      expect(h.runtime.store.tickets.get(one.ticket.id)!.assignments.at(-1)!.report).toMatchObject({ state: 'failed', summary: expect.stringContaining('Could not confirm') })
+      expect(h.runtime.health.worker).toMatchObject({ state: 'error', detail: expect.stringContaining('Could not confirm') })
+      h.hooks.prepare = undefined; h.hooks.prepareExit = undefined
+      const second = feishu('2', '@bot 修二')
+      h.runtime.receive(second); await h.runtime.pump()
+      await h.route({ kind: 'accept', trigger_id: second.id, title: 'fix', worktree_name: 'fix-two', acknowledgement: '收到。' })
+      await h.runtime.idle()
+      expect(prepares()).toBe(1)
+    } finally { one.command.resolve(); one.range.resolve(); await h.runtime.idle() }
+  })
+})
+
 it('keeps a launch that a pause cut short queued, and finishes it once processing resumes', async () => {
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, prepare: 'make worktree' } })
@@ -115,6 +314,7 @@ it('keeps a launch that a pause cut short queued, and finishes it once processin
   await h.route({ kind: 'accept', trigger_id: trigger.id, title: 'fix', worktree_name: 'fix-one', acknowledgement: '收到。' })
   await waitUntil(() => h.subprocess.spawn.mock.calls.some(([spec]) => spec.argv[0] === 'sh'))
   await h.runtime.settings.pause(true, 'panel')
+  expect(h.subprocess.spawn.mock.calls.find(([spec]) => spec.argv[0] === 'sh')![0].signal!.aborted).toBe(false)
   prepare.resolve(); await h.runtime.idle()
   const [ticket] = h.runtime.store.tickets.list()
   expect(ticket!.assignments).toEqual([expect.objectContaining({ state: 'pending' })])

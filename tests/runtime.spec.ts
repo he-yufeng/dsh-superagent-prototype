@@ -91,7 +91,9 @@ const subprocess = { spawn: vi.fn((spec: { argv: readonly string[] }) => {
   while (argv[0] === 'env' || /^[A-Z_]+=/.test(argv[0] ?? '')) argv.shift()
   const answer = answers[argv.join(' ')] ?? ''
   const reader = (text: string) => ({ readFrom: () => ({ text, nextOffset: text.length, lossy: false }) })
-  return { done: Promise.resolve({ exitCode: answer instanceof Error ? 1 : 0, signal: null }), collected: { stdout: reader(answer instanceof Error ? '' : answer), stderr: reader(answer instanceof Error ? answer.message : '') } }
+  return { done: Promise.resolve({ exitCode: answer instanceof Error ? 1 : 0, signal: null }),
+    terminate: vi.fn<() => void>(), waitForExit: vi.fn(async (signal?: AbortSignal) => !signal?.aborted),
+    collected: { stdout: reader(answer instanceof Error ? '' : answer), stderr: reader(answer instanceof Error ? answer.message : '') } }
 }) }
 /** Source account overrides for test setup; `feishu: null` disables the Feishu source. */
 interface Accounts { github?: Record<string, unknown>; feishu?: Record<string, unknown> | null }

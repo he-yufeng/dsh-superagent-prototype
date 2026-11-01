@@ -6,7 +6,7 @@
 import { lstat, mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
 import { delimiter, join, resolve } from 'node:path'
-import type { SubprocessOutputReader, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
+import type { SubprocessHandle, SubprocessOutputReader, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import type { Deployment } from '../deployment.ts'
 import { SetupError } from '../setup.ts'
 import { CliError } from './commands.ts'
@@ -125,8 +125,10 @@ export function applyEnvironment(variables: Record<string, string | undefined>, 
 }
 
 /** Spawns a command through the DSH subprocess runtime, which strips credential-shaped environment variables. */
-export async function runAsWorker(subprocess: SubprocessRuntime, argv: string[], cwd: string, signal: AbortSignal, env?: Record<string, string>): Promise<string> {
+export async function runAsWorker(subprocess: SubprocessRuntime, argv: string[], cwd: string, signal: AbortSignal,
+  env?: Record<string, string>, onSpawn?: (handle: SubprocessHandle) => void): Promise<string> {
   const handle = subprocess.spawn({ argv, cwd, graceMs: 2000, signal, ...env ? { env } : {}, stdio: { stdin: 'ignore', stdout: { maxBytes: 1 << 20 }, stderr: { maxBytes: 1 << 16 } } })
+  onSpawn?.(handle)
   const { exitCode } = await handle.done
   const read = (reader: SubprocessOutputReader | undefined): string => reader?.readFrom(0).text ?? ''
   if (exitCode === 0) return read(handle.collected.stdout)

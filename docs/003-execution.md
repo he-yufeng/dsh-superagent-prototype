@@ -48,7 +48,11 @@ Worker subagents, including nested ones, use DeepSeek Harness's `standard` prese
 
 ### Preparing a Ticket directory
 
-Before the first Assignment, if the Ticket directory does not exist, the prepare command runs once with `sh` in the execution root. It has ten minutes to finish. Without a prepare command, the worker starts in an empty directory.
+Before the first Assignment, if the Ticket directory does not exist, the prepare command runs once with `sh` in the execution root. Its managed process range has ten minutes to finish, not just the root command. Without a prepare command, the worker starts in an empty directory.
+
+Stopping the Assignment cancels its preparation after the stop transaction commits, even before a worker Session exists. A pause does not cancel an ongoing preparation; its worker waits until processing resumes. Host shutdown and the preparation deadline also cancel the command.
+
+Cancellation holds the startup slot until the subprocess provider confirms that its managed range is empty. Cleanup has a separate ten-second observation deadline. If that confirmation times out or fails, worker health reports the problem and this Runtime keeps the directory and slot held. A retry cannot bypass that barrier. Files left by the command are retained; the provider's range must be confirmed stopped before the directory can be reused. This does not establish that processes outside the provider's observable range have exited.
 
 A failed command fails the Ticket and records its output. A retry or a person's message on one of the Ticket's Threads tries preparation again. A typical command uses `git worktree` to create a checkout. A pull request belongs to the Ticket when its branch's last path segment matches the Ticket's short name.
 

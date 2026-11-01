@@ -2,6 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { SubprocessHandle } from '@deepseek-ai/dsh-subprocess'
 import { mkdir, rmdir, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { key, latestAssignment, latestReport, liveTicket, runningAssignment, threadKey, waitsForPerson } from '../core/index.ts'
@@ -41,6 +42,13 @@ const fromPerson = (input?: TicketInput): boolean => input?.kind === 'trigger' ?
  * DshExecutor catches it to mark the ticket failed immediately rather than retrying automatically, because an existing directory counts as prepared and an automatic retry would treat whatever a failed prepare command left behind in the directory as a prepared workspace.
  */
 class PrepareFailed extends Error {}
+interface Preparation {
+  assignmentId: string
+  cancel: AbortController
+  done: Promise<void>
+  /** A range whose exit could not be confirmed keeps its directory and startup slot held. */
+  failure?: PrepareFailed
+}
 const PASSING = new RegExp(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE', 'UND_ERR', 'socket hang up', 'fetch failed',
   'network error', 'overloaded', 'rate limit', '\\b(?:408|429|50[0-4])\\b'].join('|'), 'i')
 /**
@@ -218,6 +226,8 @@ export class DshExecutor implements Executor {
   private readonly settling = new Map<string, AbortController>()
   /** The stops of tickets' background work that run, by ticket, which a launch or a delivery of the ticket waits for. */
   private readonly stopping = new Map<string, Promise<void>>()
+  /** Workspace preparations that stop with their Assignment, including before a worker Session exists. */
+  private readonly preparing = new Map<string, Preparation>()
   /** The jobs workers left to a person when they handed off, by ticket, and the collecting of their ends. */
   private readonly left = new Map<string, { jobs: Set<string>; collect: AbortController }>()
   /** When a person's message typed into a worker's Session last started a turn, by ticket. */
@@ -244,21 +254,52 @@ export class DshExecutor implements Executor {
    * A failed prepare command throws `PrepareFailed`, which is not retried automatically; an empty directory it left is removed, a non-empty one kept.
    * @throws PrepareFailed with the command's output when the prepare command fails.
    */
-  private async prepareDirectory(ticket: Ticket): Promise<void> {
+  private async prepareDirectory(ticket: Ticket, assignment: Assignment): Promise<void> {
+    const quiet = Promise.withResolvers<void>()
+    const preparation: Preparation = { assignmentId: assignment.id, cancel: new AbortController(), done: quiet.promise }
+    // The rejected barrier remains available to later launches, even if no launch is waiting yet.
+    void quiet.promise.catch(() => {})
+    this.preparing.set(ticket.id, preparation)
+    const signal = AbortSignal.any([preparation.cancel.signal, this.host.lifetime, AbortSignal.timeout(PREPARE_TIMEOUT_MS)])
     const directory = ticket.execution?.directory ?? ''
-    await mkdir(dirname(directory), { recursive: true })
-    const command = this.host.store.settings().executor.prepare.trim()
-    const env = Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, variable.value]))
-    // Enforce a timeout so a hung prepare command (such as on a credential prompt) fails the ticket instead of holding a worker slot indefinitely.
-    const signal = AbortSignal.any([this.host.lifetime, AbortSignal.timeout(PREPARE_TIMEOUT_MS)])
-    if (command) await runAsWorker(this.host.context.subprocess, ['sh', '-c', command], dirname(directory), signal, env)
-      .catch(async (error: unknown) => {
-        // Remove an empty directory left by a failed prepare command so a later retry does not treat it as already prepared.
-        await rmdir(directory).catch(() => { /* Absent, or holding what the command wrote, which the output explains. */ })
-        throw new PrepareFailed(`The prepare command failed: ${error instanceof Error ? error.message : String(error)}`)
-      })
-    await mkdir(directory, { recursive: true })
-    await verifyDirectory(directory, this.host.context.subprocess, this.host.lifetime)
+    let handle: SubprocessHandle | undefined
+    try {
+      await mkdir(dirname(directory), { recursive: true })
+      signal.throwIfAborted()
+      const command = this.host.store.settings().executor.prepare.trim()
+      const env = Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, variable.value]))
+      if (command) {
+        await runAsWorker(this.host.context.subprocess, ['sh', '-c', command], dirname(directory), signal, env, value => { handle = value })
+        if (!await handle!.waitForExit(signal)) {
+          signal.throwIfAborted()
+          throw new Error('The prepare process range is still running')
+        }
+      }
+      signal.throwIfAborted()
+      await mkdir(directory, { recursive: true })
+      await verifyDirectory(directory, this.host.context.subprocess, signal)
+      signal.throwIfAborted()
+    } catch (error) {
+      if (handle) {
+        try {
+          handle.terminate()
+          // The cancellation signal is already aborted; cleanup needs its own observation deadline.
+          if (!await handle.waitForExit(AbortSignal.timeout(SHUTDOWN_STOP_MS))) throw new Error('Cleanup deadline elapsed')
+        } catch (cleanup) {
+          const failure = new PrepareFailed(`Could not confirm that the prepare process range exited: ${String(cleanup)}`)
+          preparation.failure = failure; quiet.reject(failure)
+          this.host.health.set({ state: 'error', detail: failure.message, at: now() })
+          throw failure
+        }
+      }
+      await rmdir(directory).catch(() => { /* Absent, or holding what the command wrote. */ })
+      throw new PrepareFailed(`The prepare command failed: ${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      if (!preparation.failure) {
+        if (this.preparing.get(ticket.id) === preparation) this.preparing.delete(ticket.id)
+        quiet.resolve()
+      }
+    }
   }
   /** Enqueues a `launch` effect for an accepted or resumed assignment; launches start in queue order as worker slots free up. */
   start(ticket: Ticket, assignment: Assignment): void {
@@ -281,7 +322,7 @@ export class DshExecutor implements Executor {
       if (this.host.closing() || error instanceof Later) throw error
       if (!(error instanceof PrepareFailed) && this.retries(`launch:${assignmentId}`, error)) throw error
       this.launchFailed(ticketId, assignmentId, error)
-    } finally { this.slots.free(ticketId) }
+    } finally { if (!this.preparing.get(ticketId)?.failure) this.slots.free(ticketId) }
   }
   /**
    * Delivers queued inputs to a running assignment one by one, re-reading ticket state before each delivery so delivery
@@ -361,6 +402,8 @@ export class DshExecutor implements Executor {
     const ownTurn = (report?.state === 'ready' || report?.state === 'dropped') && !busy
     const sessionId = workerSessionId(ticket.id)
     this.host.store.afterCommit(() => {
+      const preparation = this.preparing.get(ticket.id)
+      if (preparation?.assignmentId === assignment.id) preparation.cancel.abort()
       this.settling.get(ticket.id)?.abort()
       if (!ownTurn) this.host.context.agents.get(sessionId as SessionId)?.cancel({ kind: 'user' }, { keepInbox: false })
       // Its shell jobs and subagents stop with it, also those of a worker that ends its own turn.
@@ -381,6 +424,8 @@ export class DshExecutor implements Executor {
   }
   /** Wait for a stop of the ticket's background work that runs, unless the host stops first. */
   private async stopped(ticketId: string): Promise<void> {
+    const preparation = this.preparing.get(ticketId)
+    if (preparation) await until(preparation.done, this.host.lifetime)
     const stopping = this.stopping.get(ticketId)
     if (stopping) await until(stopping, this.host.lifetime)
   }
@@ -431,9 +476,12 @@ export class DshExecutor implements Executor {
     const source = sourceTrigger(this.host, ticket)
     const workspace = ticket.execution?.directory ?? ''
     if (!current()) return
+    await this.stopped(ticket.id)
+    if (!current()) return
     // Prepare the workspace directory once; an existing directory counts as already prepared, including worktrees created before `prepare` commands existed.
     if (!await stat(workspace).then(() => true, () => false)) {
-      await this.prepareDirectory(ticket)
+      if (!current()) return
+      await this.prepareDirectory(ticket, assignment)
       if (!current()) return
     }
     if (!current()) return
@@ -538,7 +586,11 @@ export class DshExecutor implements Executor {
   /** Runs background worker event handling and updates the `worker` health entry on failure or recovery. */
   private background(work: Promise<void>): Promise<void> {
     const { health } = this.host
-    return work.then(() => { if (health.get()?.state === 'error') health.set({ state: 'ready', detail: 'Worker events are handled', at: now() }) },
+    return work.then(() => {
+      if (health.get()?.state === 'error' && ![...this.preparing.values()].some(preparation => preparation.failure)) {
+        health.set({ state: 'ready', detail: 'Worker events are handled', at: now() })
+      }
+    },
       (error: unknown) => { health.set({ state: 'error', detail: String(error), at: now() }) })
   }
   /**

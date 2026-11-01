@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { vi, type Mock } from 'vitest'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
+import type { SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 import { Runtime } from '../../src/app/runtime.ts'
 import { Store } from '../../src/app/store.ts'
 import { SettingsSchema } from '../../src/policy.ts'
@@ -150,15 +151,24 @@ export async function startRuntime(seed?: (store: Store) => void) {
     ['git config -z --show-origin --get-all credential.https://github.com.helper']: `file:${workerGitConfig(directory)}\0${credentialHelper(AGENT)}\0`,
     [scoped]: `global\0credential.helper\n\0global\0credential.https://github.com.helper\n${credentialHelper(AGENT)}\0`,
   }
-  /** A prepare command (`sh -c`) waits for this while it is set. */
-  const hooks: { prepare?: Promise<void> } = {}
-  const subprocess = { spawn: vi.fn((spec: { argv: readonly string[] }) => {
+  /** A prepare command's root exit and managed range exit can be held independently of its abort signal. */
+  const hooks: { prepare?: Promise<void>; prepareExit?: Promise<void> } = {}
+  const subprocess = { spawn: vi.fn((spec: SubprocessSpawnSpec) => {
     const argv = [...spec.argv]
     while (argv[0] === 'env' || /^[A-Z_]+=/.test(argv[0] ?? '')) argv.shift()
     const reader = (text: string) => ({ readFrom: () => ({ text, nextOffset: text.length, lossy: false }) })
     const exited = { exitCode: 0, signal: null }
     const done = argv[0] === 'sh' && hooks.prepare ? hooks.prepare.then(() => exited) : Promise.resolve(exited)
-    return { done, collected: { stdout: reader(answers[argv.join(' ')] ?? ''), stderr: reader('') } }
+    const range = argv[0] === 'sh' ? hooks.prepareExit : undefined
+    const waitForExit = vi.fn<(signal?: AbortSignal) => Promise<boolean>>(async signal => {
+      if (signal?.aborted) return false
+      let abort!: () => void
+      const stopped = new Promise<false>(resolve => { abort = () => { resolve(false) } })
+      signal?.addEventListener('abort', abort, { once: true })
+      try { return await Promise.race([done.then(() => range).then(() => true), stopped]) }
+      finally { signal?.removeEventListener('abort', abort) }
+    })
+    return { done, terminate: vi.fn<() => void>(), waitForExit, collected: { stdout: reader(answers[argv.join(' ')] ?? ''), stderr: reader('') } }
   }) }
   const agents = new Map<string, FakeAgent>()
   /** Each Session's next step, which takes the messages that wait for one. */
